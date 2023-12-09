@@ -1,0 +1,28 @@
+[package]
+name = "ult_logger"
+version = "0.1.0"
+authors = []
+edition = "2021"
+
+[package.metadata.skyline]
+titleid = "01006A800016E000" # Smash Ultimate
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+skyline = "0.2.0"
+skyline_smash = { git = "https://github.com/ultimate-research/skyline-smash.git" }
+acmd = { git = "https://github.com/ultimate-research/skyline-acmd.git" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+lazy_static = "1.3.0"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+
+
