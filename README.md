@@ -16,3 +16,4 @@ cargo skyline run
 
 ## TODO
 - [ ] Record projectile state
+- [ ] Unique character state (whether Joker has Arsene, Steve block position, etc)
