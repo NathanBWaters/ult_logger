@@ -17,3 +17,6 @@ cargo skyline run
 ## TODO
 - [ ] Record projectile state
 - [ ] Unique character state (whether Joker has Arsene, Steve block position, etc)
+
+## Questions?
+Reach out on discord.playaid.app on the #open-source channel for any questions!
