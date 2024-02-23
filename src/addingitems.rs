@@ -1,26 +1,18 @@
 #![feature(repr_simd)]
 #![feature(simd_ffi)]
 
-#![feature(pointer_byte_offsets)]
-#![feature(new_uninit)]
-#![feature(vec_into_raw_parts)]
-use crate::navigation::CurrentNavigation;
-
-mod navigation;
-mod input;
-mod keyboard;
-mod playaid;
-
 use skyline;
 use acmd::acmd;
-use smash::lib::lua_const::*;
-use smash::app;
+// use smash::lib::lua_const::*;
 use smash::phx::{ Vector3f };
-use smash::app::lua_bind;
+// use smash::app::lua_bind::*;
 use smash::lib::{ lua_const, L2CValue };
-use smash::app::{ utility, sv_system, smashball };
+// use smash::app::{ utility, sv_system, smashball, Item, lua_bind::*, self };
+use smash::app::{ utility, sv_system, smashball, Item };
+use smash::cpp::l2c_value::LuaConst;
 use smash::hash40;
-use smash::lua2cpp::{ L2CFighterCommon, L2CFighterBase, L2CFighterBase_global_reset };
+use smash::phx::{ Hash40 };
+use smash::lua2cpp::{ L2CFighterBase, L2CFighterBase_global_reset };
 use serde_json::json;
 use std::sync::atomic::{ AtomicU32, Ordering };
 use std::sync::Mutex;
@@ -69,11 +61,24 @@ extern "C" {
 }
 
 static mut FIGHTER_MANAGER_ADDR: usize = 0;
+static mut ITEM_MANAGER_ADDR: usize = 0;
 
 // 0 - we haven't started logging.
 // 1 - we are actively logging.
 // 2 - we have finished logging.
 static LOGGING_STATE: AtomicU32 = AtomicU32::new(0);
+
+// Don't remove Mii hats, Pikmin, Luma, or crafting table
+const ARTICLE_ALLOWLIST: [(LuaConst, LuaConst); 8] = [
+    (FIGHTER_KIND_MIIFIGHTER, FIGHTER_MIIFIGHTER_GENERATE_ARTICLE_HAT),
+    (FIGHTER_KIND_MIISWORDSMAN, FIGHTER_MIISWORDSMAN_GENERATE_ARTICLE_HAT),
+    (FIGHTER_KIND_MIIGUNNER, FIGHTER_MIIGUNNER_GENERATE_ARTICLE_HAT),
+    (FIGHTER_KIND_ROSETTA, FIGHTER_ROSETTA_GENERATE_ARTICLE_TICO),
+    (FIGHTER_KIND_PICKEL, FIGHTER_PICKEL_GENERATE_ARTICLE_TABLE),
+    (FIGHTER_KIND_ELIGHT, FIGHTER_ELIGHT_GENERATE_ARTICLE_ESWORD),
+    (FIGHTER_KIND_EFLAME, FIGHTER_EFLAME_GENERATE_ARTICLE_ESWORD),
+    (FIGHTER_KIND_PIKMIN, FIGHTER_PIKMIN_GENERATE_ARTICLE_PIKMIN),
+];
 
 // This gets called whenever a match starts or ends. Still gets called once per fighter which is odd.
 // A typical fight will have the following logs.
@@ -97,19 +102,18 @@ static LOGGING_STATE: AtomicU32 = AtomicU32::new(0);
 //   In is_result_mode
 #[skyline::hook(replace = L2CFighterBase_global_reset)]
 pub fn on_match_start_or_end(fighter: &mut L2CFighterBase) -> L2CValue {
-    println!("[ult-logger] Hit on_match_start_or_end with logging_state = {}", LOGGING_STATE.load(Ordering::SeqCst));
     let fighter_manager = unsafe { *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager) };
-    let is_ready_go = unsafe { lua_bind::FighterManager::is_ready_go(fighter_manager) };
-    let is_result_mode = unsafe { lua_bind::FighterManager::is_result_mode(fighter_manager) };
+    let is_ready_go = unsafe { FighterManager::is_ready_go(fighter_manager) };
+    let is_result_mode = unsafe { FighterManager::is_result_mode(fighter_manager) };
 
     if !is_ready_go && !is_result_mode && LOGGING_STATE.load(Ordering::SeqCst) != 1 {
         // We are in the starting state, it's time to create a log.
-        println!("[ult-logger] Starting");
+        println!("Starting");
         LOGGING_STATE.store(1, Ordering::SeqCst);
     }
 
     if is_result_mode && LOGGING_STATE.load(Ordering::SeqCst) == 1 {
-        println!("[ult-logger] Flushing to log!");
+        println!("Flushing to log!");
         LOGGING_STATE.store(2, Ordering::SeqCst);
 
         let mut buffer = BUFFER.lock().unwrap();
@@ -127,16 +131,7 @@ pub fn on_match_start_or_end(fighter: &mut L2CFighterBase) -> L2CValue {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_millis();
-        // *file_path = format!("sd:/fight-{}-vs-{}-{}.txt", fighter1, fighter2, event_time);
-
-        let mut replay_id = "XXXXXXXX";
-        unsafe {
-            // This is index - 1 because we increment right after we input info into the keyboard.
-            // This is sloppy code.
-            replay_id = playaid::TEST_ID[playaid::ID_INDEX - 1];
-        }
-
-        *file_path = format!("sd:/{}-{}.txt", replay_id, event_time);
+        *file_path = format!("sd:/fight-{}-vs-{}-{}.txt", fighter1, fighter2, event_time);
         File::create(&*file_path);
 
         let file = OpenOptions::new().write(true).append(true).open(&*file_path);
@@ -150,7 +145,7 @@ pub fn on_match_start_or_end(fighter: &mut L2CFighterBase) -> L2CValue {
             panic!("Couldn't write to file: {}", e);
         }
 
-        println!("[ult-logger] Wrote to {}", file_path.to_string());
+        println!("Wrote to {}", file_path.to_string());
         // Clear the buffer after writing
         buffer.clear();
     }
@@ -170,18 +165,64 @@ macro_rules! actionable_statuses {
 }
 
 unsafe fn can_act(module_accessor: *mut app::BattleObjectModuleAccessor) -> bool {
-    smash::app::lua_bind::CancelModule::is_enable_cancel(module_accessor) ||
+    CancelModule::is_enable_cancel(module_accessor) ||
         actionable_statuses!()
             .iter()
             .any(|actionable_transition| {
-                smash::app::lua_bind::WorkModule::is_enable_transition_term(
-                    module_accessor,
-                    **actionable_transition
-                )
+                WorkModule::is_enable_transition_term(module_accessor, **actionable_transition)
             })
 }
 
-pub fn once_per_frame_per_fighter(fighter: &mut L2CFighterCommon) {
+pub unsafe fn record_articles(
+    fighter_kind: i32,
+    module_accessor: &mut app::BattleObjectModuleAccessor
+) {
+    SoundModule::stop_all_sound(module_accessor);
+    // All articles have ID <= 0x25
+    (0..=0x25)
+        .filter(|article_idx| {
+            !ARTICLE_ALLOWLIST.iter().any(|article_allowed| {
+                article_allowed.0 == fighter_kind && article_allowed.1 == *article_idx
+            })
+        })
+        .for_each(|article_idx| {
+            if ArticleModule::is_exist(module_accessor, article_idx) {
+                let article: *mut app::Article = ArticleModule::get_article(
+                    module_accessor,
+                    article_idx
+                );
+                // let article_object_id = Article::get_battle_object_id(article);
+                // ArticleModule::remove_exist_object_id(module_accessor, article_object_id as u32);
+            }
+        });
+    let item_mgr = *(ITEM_MANAGER_ADDR as *mut *mut app::ItemManager);
+    (0..ItemManager::get_num_of_active_item_all(item_mgr)).for_each(|item_idx| {
+        let item = ItemManager::get_active_item(item_mgr, item_idx);
+        if item != 0 {
+            let item = item as *mut Item;
+            // let item_battle_object_id = app::Item::get_battle_object_id(item) as u32;
+            // ItemManager::remove_item_from_id(item_mgr, item_battle_object_id);
+        }
+    });
+    MotionAnimcmdModule::set_sleep(module_accessor, true);
+    SoundModule::pause_se_all(module_accessor, true);
+    ControlModule::stop_rumble(module_accessor, true);
+    SoundModule::stop_all_sound(module_accessor);
+    // Return camera to normal when loading save state
+    SlowModule::clear_whole(module_accessor);
+    CameraModule::zoom_out(module_accessor, 0);
+    // Remove blue effect (but does not remove darkened screen)
+    EffectModule::kill_kind(module_accessor, Hash40::new("sys_bg_criticalhit"), false, false);
+    // Removes the darkened screen from special zooms
+    // If there's a crit that doesn't get removed, it's likely bg_criticalhit2.
+    EffectModule::remove_screen(module_accessor, Hash40::new("bg_criticalhit"), 0);
+    // Remove all quakes to prevent screen shake lingering through load.
+    for quake_kind in *CAMERA_QUAKE_KIND_NONE..=*CAMERA_QUAKE_KIND_MAX {
+        CameraModule::stop_quake(module_accessor, quake_kind);
+    }
+}
+
+pub fn once_per_frame_per_fighter(fighter: &mut smash::common::root::lua2cpp::L2CFighterCommon) {
     let mut fighter_log_count = FIGHTER_LOG_COUNT.lock().unwrap();
     *fighter_log_count += 1;
 
@@ -196,51 +237,51 @@ pub fn once_per_frame_per_fighter(fighter: &mut L2CFighterCommon) {
 
         // If True, the game has started and the characters can move around.  Otherwise, it's still loading with the
         // countdown.
-        let game_started = lua_bind::FighterManager::is_ready_go(fighter_manager);
+        let game_started = FighterManager::is_ready_go(fighter_manager);
 
         if !game_started {
-            // println!("[ult-logger] Game not ready yet");
+            // println!("Game not ready yet");
             return;
         }
 
         let num_frames_left = get_remaining_time_as_frame();
 
-        let fighter_id = lua_bind::WorkModule::get_int(
+        let fighter_id = WorkModule::get_int(
             module_accessor,
             *lua_const::FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID
         ) as i32;
 
-        let fighter_information = lua_bind::FighterManager::get_fighter_information(
+        let fighter_information = FighterManager::get_fighter_information(
             fighter_manager,
             app::FighterEntryID(fighter_id)
         ) as *mut app::FighterInformation;
-        let stock_count = lua_bind::FighterInformation::stock_count(fighter_information) as u8;
-        let fighter_status_kind = lua_bind::StatusModule::status_kind(module_accessor);
+        let stock_count = FighterInformation::stock_count(fighter_information) as u8;
+        let fighter_status_kind = StatusModule::status_kind(module_accessor);
         let fighter_name = utility::get_kind(module_accessor);
-        let fighter_motion_kind = lua_bind::MotionModule::motion_kind(module_accessor);
-        let fighter_damage = lua_bind::DamageModule::damage(module_accessor, 0);
-        let fighter_shield_size = lua_bind::WorkModule::get_float(
+        let fighter_motion_kind = MotionModule::motion_kind(module_accessor);
+        let fighter_damage = DamageModule::damage(module_accessor, 0);
+        let fighter_shield_size = WorkModule::get_float(
             module_accessor,
             *lua_const::FIGHTER_INSTANCE_WORK_ID_FLOAT_GUARD_SHIELD
         );
-        let attack_connected = lua_bind::AttackModule::is_infliction_status(
+        let attack_connected = AttackModule::is_infliction_status(
             module_accessor,
             *lua_const::COLLISION_KIND_MASK_HIT
         );
-        let hitstun_left = lua_bind::WorkModule::get_float(
+        let hitstun_left = WorkModule::get_float(
             module_accessor,
             *lua_const::FIGHTER_INSTANCE_WORK_ID_FLOAT_DAMAGE_REACTION_FRAME
         );
         let can_act = can_act(module_accessor);
-        let pos_x = lua_bind::PostureModule::pos_x(module_accessor);
-        let pos_y = lua_bind::PostureModule::pos_y(module_accessor);
-        let facing = lua_bind::PostureModule::lr(module_accessor);
+        let pos_x = PostureModule::pos_x(module_accessor);
+        let pos_y = PostureModule::pos_y(module_accessor);
+        let facing = PostureModule::lr(module_accessor);
         let cam_pos = get_camera_pos();
         let internal_cam_pos = get_internal_camera_pos();
         let cam_target = get_camera_target();
         let cam_fov = get_camera_fov();
         let stage_id = get_stage_id();
-        let animation_frame_num = smash::app::lua_bind::MotionModule::frame(module_accessor);
+        let animation_frame_num = MotionModule::frame(module_accessor);
 
         if fighter_id == 0 {
             let mut fighter1 = FIGHTER_1.lock().unwrap();
@@ -287,94 +328,48 @@ pub fn once_per_frame_per_fighter(fighter: &mut L2CFighterCommon) {
         if PUSH_TO_BUFFER {
             buffer.push_str(&format!("{}\n", json_log));
         }
-    }
-}
 
-#[repr(C)]
-#[derive(Debug)]
-pub struct FixedBaseString<const N: usize> {
-    fnv: u32,
-    string_len: u32,
-    string: [u8; N],
-}
+        // Write buffer to file every 50 frames
+        let FLUSH_ON_INTERVAL = false;
+        if FLUSH_ON_INTERVAL && *fighter_log_count % 100 == 0 {
+            let mut file_path = FILE_PATH.lock().unwrap();
 
-#[repr(C)]
-#[derive(Debug)]
-pub struct SceneQueue {
-    end: *const u64,
-    start: *const u64,
-    count: usize,
-    active_scene: FixedBaseString<64>,
-    previous_scene: FixedBaseString<64>,
-}
+            if file_path.is_empty() {
+                println!("FILE_PATH is empty, giving it a new path");
+                let fighter1 = FIGHTER_1.lock().unwrap();
 
-#[skyline::hook(offset = 0x3724c10)]
-fn change_scene_sequence(
-    queue: &SceneQueue,
-    fnv1: &mut FixedBaseString<64>,
-    fnv2: &mut FixedBaseString<64>,
-    parameters: *const u8
-) {
-    if
-        &fnv1.string[0..24] == b"OnlineShareSequenceScene" &&
-        &fnv2.string[0..17] == b"MenuSequenceScene"
-    {
-        println!("[ult-logger] Made it to Shared Content!");
-        unsafe {
-            navigation::NAV = CurrentNavigation::ScWaitingForLoad;
-        }
-    }
-    call_original!(queue, fnv1, fnv2, parameters);
-}
+                let fighter2 = FIGHTER_2.lock().unwrap();
 
-#[skyline::from_offset(0x39c4bb0)]
-fn begin_auto_sleep_disabled();
+                *file_path = format!(
+                    "sd:/fight-{}-vs-{}-{}-{}-{}-take3.txt",
+                    fighter1,
+                    fighter2,
+                    fighter_motion_kind,
+                    pos_x,
+                    pos_y
+                );
+                File::create(&*file_path);
+            }
 
-#[skyline::hook(offset = 0x39c4bd0)]
-fn end_auto_sleep_disabled() {
-    // We don't want to auto-sleep ever, so don't let this end
-}
+            let file = OpenOptions::new().write(true).append(true).open(&*file_path);
 
-#[skyline::hook(offset = 0x39c4bc0)]
-fn kill_backlight() {
-    // We don't want to kill backlight ever, so don't let this happen
-}
-
-fn hook_panic() {
-    std::panic::set_hook(
-        Box::new(|info| {
-            let location = info.location().unwrap();
-
-            let msg = match info.payload().downcast_ref::<&'static str>() {
-                Some(s) => *s,
-                None => {
-                    match info.payload().downcast_ref::<String>() {
-                        Some(s) => &s[..],
-                        None => "Box<Any>",
-                    }
-                }
+            let mut file = match file {
+                Err(e) => panic!("Couldn't open file: {}", e),
+                Ok(file) => file,
             };
 
-            let err_msg = format!("thread has panicked at '{}', {}", msg, location);
-            skyline::error::show_error(
-                69,
-                "Skyline plugin has panicked! Please open the details and send a screenshot to the developer, then close the game.\n\0",
-                err_msg.as_str()
-            );
-        })
-    );
-}
+            if let Err(e) = write!(file, "{}", buffer.as_str()) {
+                panic!("Couldn't write to file: {}", e);
+            }
 
-// Use this for general per-frame weapon-level hooks
-// Reference: https://gist.github.com/jugeeya/27b902865408c916b1fcacc486157f79
-pub fn once_per_weapon_frame(fighter_base: &mut L2CFighterBase) {
-    unsafe {
-        let module_accessor = smash::app::sv_system::battle_object_module_accessor(
-            fighter_base.lua_state_agent
-        );
-        println!("[ult-logger] Frame : {}", smash::app::lua_bind::MotionModule::frame(module_accessor));
+            // Clear the buffer after writing
+            buffer.clear();
+        }
     }
 }
+
+// Explicitly cast the function item to a function pointer
+const once_per_frame_per_fighter_ptr: fn(&mut smash::common::root::lua2cpp::L2CFighterCommon) = once_per_frame_per_fighter;
 
 fn nro_main(nro: &skyline::nro::NroInfo<'_>) {
     match nro.name {
@@ -387,7 +382,7 @@ fn nro_main(nro: &skyline::nro::NroInfo<'_>) {
 
 #[skyline::main(name = "ult_logger")]
 pub fn main() {
-    println!("[ult-logger] !!! v16 !!!");
+    println!("v13 - Playaid Logger");
 
     unsafe {
         skyline::nn::ro::LookupSymbol(
@@ -396,32 +391,14 @@ pub fn main() {
         );
     }
 
+    unsafe {
+        skyline::nn::ro::LookupSymbol(
+            &mut ITEM_MANAGER_ADDR,
+            "_ZN3lib9SingletonIN3app11ItemManagerEE9instance_E\0".as_bytes().as_ptr()
+        );
+    }
+
     skyline::nro::add_hook(nro_main).unwrap();
 
-    acmd::add_custom_hooks!(once_per_frame_per_fighter);
-
-    // Add panic hook
-    hook_panic();
-
-    // Initialize hooks for navigation and keyboard
-    navigation::init();
-    keyboard::init();
-
-    // Initialize hooks for scene usage
-    skyline::install_hooks!(change_scene_sequence, kill_backlight, end_auto_sleep_disabled);
-
-    // Initialize hooks for input (from result_screen_skip)
-    std::thread::sleep(std::time::Duration::from_secs(20)); //makes it not crash on startup with arcrop bc ???
-    println!("[ult-logger] [Auto-Replay] Installing input hook...");
-    unsafe {
-        if (input::add_nn_hid_hook as *const ()).is_null() {
-            panic!(
-                "The NN-HID hook plugin could not be found and is required to add NRO hooks. Make sure libnn_hid_hook.nro is installed."
-            );
-        }
-        input::add_nn_hid_hook(input::handle_get_npad_state_start);
-
-        println!("[ult-logger] Disabling Auto Sleep");
-        begin_auto_sleep_disabled()
-    }
+    acmd::add_custom_hooks!(once_per_frame_per_fighter_ptr);
 }
